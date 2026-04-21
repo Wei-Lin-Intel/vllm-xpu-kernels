@@ -55,6 +55,11 @@ def gelu_tanh_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
     torch.ops._C.gelu_tanh_and_mul(out, input)
 
 
+def fatrelu_and_mul(out: torch.Tensor, input: torch.Tensor,
+                    threshold: float) -> None:
+    torch.ops._C.fatrelu_and_mul(out, input, threshold)
+
+
 def rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,

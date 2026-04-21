@@ -72,6 +72,12 @@ inline T gelu_tanh_kernel(const T& x) {
   return (T)(0.5f * f * (1.0f + sycl::tanh(inner)));
 }
 
+template <typename T>
+inline T fatrelu_kernel(const T& x, const float threshold) {
+  const float f = (float)x;
+  return (T)(f > threshold ? f : 0.0f);
+}
+
 template <
     typename scalar_t,
     scalar_t (*ACT_FN)(const scalar_t&),
@@ -227,6 +233,47 @@ class act_and_mul_quant_vec_kernel {
   const int d_;
 };
 
+template <
+    typename scalar_t,
+    scalar_t (*ACT_FN)(const scalar_t&, const float),
+    int VEC_SIZE>
+class act_and_mul_with_param_vec_kernel {
+ public:
+  act_and_mul_with_param_vec_kernel(
+      scalar_t* __restrict__ out,
+      const scalar_t* __restrict__ input,
+      const int d,
+      const float param)
+      : out_(out), input_(input), d_(d), param_(param) {}
+
+  void operator()(sycl::nd_item<1> item) const {
+    using vec_t = vllm::xpu::aligned_vec<scalar_t, VEC_SIZE>;
+    const int64_t token_idx = item.get_group(0);
+    const int64_t offset = item.get_local_linear_id();
+    const int64_t step = item.get_local_range(0);
+    const int64_t bound = d_ / VEC_SIZE;
+
+    for (int64_t i = offset; i < bound; i += step) {
+      auto x_vec =
+          reinterpret_cast<const vec_t*>(input_)[token_idx * bound * 2 + i];
+      auto y_vec = reinterpret_cast<const vec_t*>(
+          input_)[token_idx * bound * 2 + i + bound];
+      vec_t out_vec;
+#pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j) {
+        out_vec[j] = ACT_FN(x_vec[j], param_) * y_vec[j];
+      }
+      reinterpret_cast<vec_t*>(out_)[token_idx * bound + i] = out_vec;
+    }
+  }
+
+ private:
+  scalar_t* __restrict__ out_;
+  const scalar_t* __restrict__ input_;
+  const int d_;
+  const float param_;
+};
+
 template <typename T>
 [[intel::device_indirectly_callable]] inline __attribute__((always_inline)) T
 swigluoai_and_mul(const T& gate, const T& up, float alpha, float limit) {
@@ -366,6 +413,17 @@ class swiglustep_and_mul_kernel {
     break;                                                            \
   }
 
+#define VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, N)                  \
+  case N: {                                                           \
+    queue.submit([&](sycl::handler& cgh) {                            \
+      cgh.parallel_for(                                               \
+          sycl::nd_range<1>(num_tokens * wg_size, wg_size),           \
+          vllm::act_and_mul_with_param_vec_kernel<sycl_t, KERNEL, N>( \
+              (sycl_t*)out_ptr, (sycl_t*)input_ptr, d, param));       \
+    });                                                               \
+    break;                                                            \
+  }
+
 #define LAUNCH_ACTIVATION_GATE_KERNEL_VEC(KERNEL, ACT_FIRST)             \
   using sycl_t = vllm::xpu::SyclTypeTrait<scalar_t>::Type;               \
   int d = input.size(-1) / 2;                                            \
@@ -394,6 +452,39 @@ class swiglustep_and_mul_kernel {
     VEC_LAUNCH_ACT_AND_MUL(KERNEL, ACT_FIRST, 4);                        \
     VEC_LAUNCH_ACT_AND_MUL(KERNEL, ACT_FIRST, 8);                        \
     VEC_LAUNCH_ACT_AND_MUL(KERNEL, ACT_FIRST, 16);                       \
+    default:                                                             \
+      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);         \
+  }
+
+#define LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM_VEC(KERNEL, PARAM)      \
+  using sycl_t = vllm::xpu::SyclTypeTrait<scalar_t>::Type;               \
+  int d = input.size(-1) / 2;                                            \
+  int64_t num_tokens = input.numel() / input.size(-1);                   \
+  if (num_tokens == 0) {                                                 \
+    return;                                                              \
+  }                                                                      \
+  auto out_ptr = out.data_ptr<scalar_t>();                               \
+  auto input_ptr = input.data_ptr<scalar_t>();                           \
+  const float param = static_cast<float>(PARAM);                         \
+  at::DeviceGuard device_guard(input.device());                          \
+  auto& queue = vllm::xpu::vllmGetQueue();                               \
+  int vec_size = static_cast<int>(sizeof(float) * 4 / sizeof(scalar_t)); \
+  {                                                                      \
+    int64_t tmp_wg =                                                     \
+        std::min(static_cast<int64_t>(d), static_cast<int64_t>(1024));   \
+    while (vec_size > 1 && (vec_size >> 1) * tmp_wg >= d) {              \
+      vec_size = vec_size >> 1;                                          \
+    }                                                                    \
+  }                                                                      \
+  if (d % vec_size != 0) vec_size = 1;                                   \
+  int64_t wg_size = std::min(                                            \
+      static_cast<int64_t>(d / vec_size), static_cast<int64_t>(1024));   \
+  switch (vec_size) {                                                    \
+    VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, 1);                        \
+    VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, 2);                        \
+    VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, 4);                        \
+    VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, 8);                        \
+    VEC_LAUNCH_ACT_AND_MUL_WITH_PARAM(KERNEL, 16);                       \
     default:                                                             \
       TORCH_CHECK(false, "Unsupported vector size: ", vec_size);         \
   }
@@ -498,6 +589,16 @@ void gelu_tanh_and_mul(
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL_VEC(vllm::gelu_tanh_kernel, true);
+  });
+}
+
+void fatrelu_and_mul(
+    torch::Tensor& out,    // [..., d]
+    torch::Tensor& input,  // [..., 2 * d]
+    double threshold) {
+  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "fatrelu_and_mul", [&] {
+    LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM_VEC(
+        vllm::fatrelu_kernel, threshold);
   });
 }
 

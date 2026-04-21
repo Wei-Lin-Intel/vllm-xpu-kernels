@@ -96,6 +96,31 @@ class GeluAndMul(CustomOp):
         return f'approximate={repr(self.approximate)}'
 
 
+class FatreluAndMul(CustomOp):
+
+    def __init__(self, threshold: float):
+        super().__init__()
+        self.threshold = threshold
+        self.op = ops.fatrelu_and_mul
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        x1 = x[..., :d]
+        x2 = x[..., d:]
+        x1 = F.threshold(x1, self.threshold, 0.0)
+        return x1 * x2
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = (x.shape[:-1] + (d, ))
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        self.op(out, x, self.threshold)
+        return out
+
+    def extra_repr(self) -> str:
+        return f'threshold={self.threshold!r}'
+
+
 class FastGELU(CustomOp):
 
     def __init__(self):
